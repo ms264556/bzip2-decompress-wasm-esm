@@ -1,98 +1,81 @@
-//
-// Created by matt on 16/03/19.
-//
-
-#include <string>
-#include <sstream>
-#include <iostream>
-#include <bzlib.h>
 #include <emscripten/bind.h>
-#include <iomanip>
+#include <vector>
+#include <string>
+#include <bzlib.h>
+#include <stdlib.h>
 
-class BZ2CC {
-public:
-    BZ2CC() = default;
-    int error = BZ_OK;
+struct BZ2Result {
+    int error;
     std::string error_msg;
-    unsigned char* output;
-    unsigned int outLen;
-
-    emscripten::val getOutput() const {
-        return emscripten::val(emscripten::typed_memory_view(outLen, output));
-    }
+    uintptr_t output_ptr; 
+    unsigned int output_len;
 };
 
-BZ2CC compressBZ2 (std::string input, int block_size, int work_factor) {
-    BZ2CC resp;
-    // Convert C++ strings to terrible C pointer arrays
-    auto inp = (char*) input.c_str();
-    resp.outLen = (unsigned int) (input.length() * 1.01) + 600; // Advised output buffer length is 101% of input + 600 bytes
-    char* out = new char[resp.outLen];
-    resp.error = BZ2_bzBuffToBuffCompress(out, &resp.outLen, inp, (unsigned int) input.length(), block_size, 0, work_factor);
-    switch (resp.error) {
-        case BZ_OK:
-            resp.output = (unsigned char*) out;
+BZ2Result decompress(uintptr_t input_ptr, unsigned int input_len) {
+    BZ2Result resp;
+    resp.output_ptr = 0;
+    resp.output_len = 0;
+
+    char* input_buffer = reinterpret_cast<char*>(input_ptr);
+    
+    if (input_len == 0) {
+        resp.error = BZ_OK;
+        return resp;
+    }
+
+    unsigned int decompressed_size = input_len * 4;
+    std::vector<unsigned char> output_vec;
+    if (decompressed_size < 4096) decompressed_size = 4096;
+    output_vec.resize(decompressed_size);
+
+    while (true) {
+        resp.error = BZ2_bzBuffToBuffDecompress(
+            (char*)output_vec.data(),
+            &decompressed_size,
+            input_buffer,
+            input_len,
+            0, 0
+        );
+
+        if (resp.error == BZ_OK) {
+            resp.output_len = decompressed_size;
+            resp.output_ptr = reinterpret_cast<uintptr_t>(malloc(decompressed_size));
+            if (resp.output_ptr) {
+                memcpy(reinterpret_cast<void*>(resp.output_ptr), output_vec.data(), decompressed_size);
+            } else {
+                resp.error = BZ_MEM_ERROR;
+                resp.error_msg = "Failed to allocate memory for the output buffer.";
+            }
             break;
-        case BZ_CONFIG_ERROR:
-        case BZ_PARAM_ERROR:
-        case BZ_OUTBUFF_FULL:
-            resp.error_msg = "There's been an issue with libbzip2-wasm. Please file an issue at https://github.com/artemisbot/libbzip2-wasm.";
+        } else if (resp.error == BZ_OUTBUFF_FULL) {
+            if (output_vec.size() > 100 * 1024 * 1024) { 
+                 resp.error_msg = "The decompressed data exceeds the 100MB safety limit.";
+                 break;
+            }
+            decompressed_size = output_vec.size() * 2;
+            output_vec.resize(decompressed_size);
+        } else {
+            switch (resp.error) {
+                case BZ_DATA_ERROR_MAGIC: resp.error_msg = "Data magic error: Not a valid bzip2 file."; break;
+                default: resp.error_msg = "An unknown error occurred during decompression."; break;
+            }
             break;
-        case BZ_MEM_ERROR:
-            resp.error_msg = "libbzip2-wasm has run out of memory.";
-            break;
-        default:
-            resp.error_msg = "Unknown error.";
-            break;
+        }
     }
     return resp;
 }
 
-BZ2CC decompressBZ2 (std::string input, int small) {
-    BZ2CC resp;
-    // Convert C++ strings to terrible C pointer arrays
-    auto inp = (char*) input.c_str();
-    resp.outLen = (unsigned int) 10000000; // I'm pretty sure that bzip2 isn't *this* good
-    char* out = new char[resp.outLen];
-    resp.error = BZ2_bzBuffToBuffDecompress(out, &resp.outLen, inp, (unsigned int) input.length(), small, 0);
-    switch (resp.error) {
-        case BZ_OK:
-            resp.output = (unsigned char*) out;
-            break;
-        case BZ_CONFIG_ERROR:
-        case BZ_PARAM_ERROR:
-            resp.error_msg = "There's been an issue with libbzip2-wasm. Please file an issue at https://github.com/artemisbot/libbzip2-wasm.";
-            break;
-        case BZ_OUTBUFF_FULL:
-            resp.error_msg = "The decompressed data exceeds the length of the destination buffer. The max size of a decrypted file is 100MB.";
-            break;
-        case BZ_MEM_ERROR:
-            resp.error_msg = "libbzip2-wasm has run out of memory.";
-            break;
-        case BZ_DATA_ERROR:
-            resp.error_msg = "The input data did not pass the integrity checks.";
-            break;
-        case BZ_DATA_ERROR_MAGIC:
-            resp.error_msg = "The input data does not begin with the correct magic bytes.";
-            break;
-        case BZ_UNEXPECTED_EOF:
-            resp.error_msg = "The input data ends unexpectedly.";
-            break;
-        default:
-            resp.error_msg = "Unknown error.";
-            break;
-    }
-    return resp;
+void free_result_memory(uintptr_t ptr) {
+    free(reinterpret_cast<void*>(ptr));
 }
-
-
 
 EMSCRIPTEN_BINDINGS(my_module) {
-    emscripten::class_<BZ2CC>("BZ2CC")
-            .property("errorMsg", &BZ2CC::error_msg)
-            .property("error", &BZ2CC::error)
-            .property("output", &BZ2CC::getOutput);
+    emscripten::class_<BZ2Result>("BZ2Result")
+        .property("error", &BZ2Result::error)
+        .property("errorMsg", &BZ2Result::error_msg)
+        .property("outputPtr", &BZ2Result::output_ptr)
+        .property("outputLen", &BZ2Result::output_len);
 
-    emscripten::function("compressBZ2", &compressBZ2);
-    emscripten::function("decompressBZ2", &decompressBZ2);
+    emscripten::function("decompress", &decompress, emscripten::allow_raw_pointers());
+    emscripten::function("free_result_memory", &free_result_memory, emscripten::allow_raw_pointers());
 }

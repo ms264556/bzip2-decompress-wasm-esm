@@ -1,6 +1,5 @@
 build/
-*.js
-*.wasm
+node_modules/
 cmake-build-debug/
 .idea
-dist/
+package-lock.json

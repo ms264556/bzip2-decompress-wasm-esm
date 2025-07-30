@@ -1,8 +1,0 @@
-.travis.yml
-CMakeLists.txt
-*.cpp
-*.hpp
-build/
-cmake-build-debug/
-clamav-yara/
-.idea
