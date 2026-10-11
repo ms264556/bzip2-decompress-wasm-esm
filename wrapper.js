@@ -2,6 +2,9 @@ import Bzip2ModuleFactory from './bzip2-wasm-es.js';
 
 const bzip2Module = await Bzip2ModuleFactory();
 
+const BZ_OK = 0;
+const BZ_STREAM_END = 4;
+
 /**
  * Decompresses a Uint8Array of bzip2 compressed data.
  * @param {Uint8Array} compressedBytes The raw bytes of the compressed file.
@@ -17,32 +20,50 @@ function decompress(compressedBytes) {
         return new Uint8Array(0);
     }
 
-    let inputPtr = 0;
-    let result = null;
+    const bufferSize = bzip2Module.get_buffer_size();
+    const inputPtr = bzip2Module.get_input_buffer();
+    const outputPtr = bzip2Module.get_output_buffer();
 
+    const chunks = [];
+    let outputLength = 0;
+    let inputOffset = 0;
+
+    // The data is passed through the module a bufferful at a time, so the module never needs to hold all of it.
+    // Each step is a separate call, which also lets the engine switch to optimized code along the way.
+    let status = bzip2Module.begin();
     try {
-        inputPtr = bzip2Module._malloc(compressedBytes.length);
-        if (inputPtr === 0) {
-            throw new Error("Bzip2: Failed to allocate memory for input buffer.");
-        }
-        bzip2Module.HEAPU8.set(compressedBytes, inputPtr);
-        result = bzip2Module.decompress(inputPtr, compressedBytes.length);
-        if (result.error !== 0) {
-            throw new Error(`Bzip2 decompression failed: ${result.errorMsg} (code: ${result.error})`);
-        }
-        const outputBytes = bzip2Module.HEAPU8.slice(result.outputPtr, result.outputPtr + result.outputLen);
-        return outputBytes;
-    } finally {
-        if (inputPtr) {
-            bzip2Module._free(inputPtr);
-        }
-        if (result) {
-            if (result.outputPtr) {
-                bzip2Module.free_result_memory(result.outputPtr);
+        while (status === BZ_OK) {
+            if (bzip2Module.needs_input()) {
+                const inputChunk = compressedBytes.subarray(inputOffset, inputOffset + bufferSize);
+                bzip2Module.HEAPU8.set(inputChunk, inputPtr);
+                bzip2Module.supply_input(inputChunk.length);
+                inputOffset += inputChunk.length;
             }
-            result.delete();
+            status = bzip2Module.step();
+            const chunkLength = bzip2Module.get_output_length();
+            if (chunkLength > 0) {
+                chunks.push(bzip2Module.HEAPU8.slice(outputPtr, outputPtr + chunkLength));
+                outputLength += chunkLength;
+            }
         }
+    } finally {
+        bzip2Module.end();
     }
+
+    if (status !== BZ_STREAM_END) {
+        throw new Error(`Bzip2 decompression failed: ${bzip2Module.describe_error(status)} (code: ${status})`);
+    }
+
+    if (chunks.length === 1) {
+        return chunks[0];
+    }
+    const outputBytes = new Uint8Array(outputLength);
+    let outputOffset = 0;
+    for (const chunk of chunks) {
+        outputBytes.set(chunk, outputOffset);
+        outputOffset += chunk.length;
+    }
+    return outputBytes;
 }
 
 const Bzip2 = { decompress };
